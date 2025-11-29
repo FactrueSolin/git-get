@@ -1,0 +1,16 @@
+[package]
+name = "git-get"
+version = "0.1.0"
+edition = "2021"
+description = "从 GitHub 仓库下载指定子目录的命令行工具"
+license = "MIT"
+
+[dependencies]
+# CLI 参数解析
+clap = { version = "4", features = ["derive"] }
+# 错误处理
+anyhow = "1"
+# 临时目录管理
+tempfile = "3"
+# 目录复制
+fs_extra = "1"
