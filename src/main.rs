@@ -1,8 +1,8 @@
-//! git-get: 从 GitHub 仓库下载指定子目录的命令行工具
+//! git-get: 从 GitHub 仓库下载指定子目录或整个仓库的命令行工具
 //!
 //! 主要功能：
-//! - 在临时目录中克隆仓库（使用 sparse-checkout 优化）
-//! - 将指定子目录复制到目标路径
+//! - 在临时目录中克隆仓库（子目录模式使用 sparse-checkout 优化）
+//! - 将指定子目录或整个仓库复制到目标路径
 //! - 自动清理临时文件，不污染当前项目的 .git 结构
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
-/// 从 GitHub 仓库下载指定子目录到本地
+/// 从 GitHub 仓库下载指定子目录或整个仓库到本地
 #[derive(Parser, Debug)]
 #[command(name = "git-get")]
 #[command(author, version, about, long_about = None)]
@@ -28,11 +28,11 @@ struct Args {
     #[arg(short, long)]
     branch: Option<String>,
 
-    /// 仓库内的子目录路径（当使用简写格式时必填，URL 格式时会自动提取）
+    /// 仓库内的子目录路径（可选，URL 格式时会自动提取）
     #[arg(short, long)]
     path: Option<String>,
 
-    /// 本地目标目录路径（可选，默认使用 path 的最后一段）
+    /// 本地目标目录路径（可选，默认使用 path 的最后一段或仓库名）
     #[arg(short, long)]
     dest: Option<String>,
 
@@ -67,19 +67,31 @@ fn run() -> Result<()> {
     // 解析输入，获取 repo、branch、path
     let (repo, branch, path) = parse_input(&args)?;
 
-    // 决定目标路径（如果未提供，使用 path 的最后一段）
+    // 决定目标路径（如果未提供，使用 path 的最后一段或仓库名）
     let dest = args.dest.unwrap_or_else(|| {
-        path.split('/')
-            .last()
-            .unwrap_or("download")
-            .to_string()
+        if let Some(path) = path.as_deref() {
+            path.split('/')
+                .last()
+                .unwrap_or("download")
+                .to_string()
+        } else {
+            repo.split('/')
+                .last()
+                .unwrap_or("download")
+                .trim_end_matches(".git")
+                .to_string()
+        }
     });
 
     // 验证并构建仓库 URL
     let repo_url = build_repo_url(&repo)?;
     println!("📦 仓库: {}", repo_url);
     println!("🌿 分支: {}", branch);
-    println!("📁 子目录: {}", path);
+    if let Some(path) = path.as_deref() {
+        println!("📁 子目录: {}", path);
+    } else {
+        println!("📁 子目录: <整个仓库>");
+    }
     println!("📍 目标路径: {}", dest);
 
     // 检查目标路径安全性
@@ -91,22 +103,31 @@ fn run() -> Result<()> {
     let temp_path = temp_dir.path();
     println!("🔧 临时目录: {}", temp_path.display());
 
-    // 在临时目录中执行 sparse-checkout 克隆
-    clone_with_sparse_checkout(temp_path, &repo_url, &branch, &path, args.token.as_deref())?;
+    // 在临时目录中克隆仓库：有 path 时仅拉取子目录；无 path 时拉取整个仓库
+    clone_repository(temp_path, &repo_url, &branch, path.as_deref(), args.token.as_deref())?;
 
-    // 验证子目录存在
-    let source_path = temp_path.join(&path);
-    if !source_path.exists() {
-        bail!(
-            "远程仓库中未找到指定子目录: {}",
-            path
-        );
-    }
+    // 确定源路径
+    let source_path = if let Some(path) = path.as_deref() {
+        let source_path = temp_path.join(path);
+        if !source_path.exists() {
+            bail!(
+                "远程仓库中未找到指定子目录: {}",
+                path
+            );
+        }
+        source_path
+    } else {
+        temp_path.to_path_buf()
+    };
 
     // 复制子目录到目标路径
     copy_directory(&source_path, &dest_path)?;
 
-    println!("✅ 完成! 子目录已复制到: {}", dest);
+    if path.is_some() {
+        println!("✅ 完成! 子目录已复制到: {}", dest);
+    } else {
+        println!("✅ 完成! 仓库已复制到: {}", dest);
+    }
 
     // 尝试添加到 .gitignore
     add_to_gitignore(&dest)?;
@@ -118,7 +139,7 @@ fn run() -> Result<()> {
 /// 解析用户输入，支持两种模式：
 /// 1. URL 模式：从完整的 GitHub URL 中提取信息
 /// 2. 分散参数模式：使用 --repo, --branch, --path 参数
-fn parse_input(args: &Args) -> Result<(String, String, String)> {
+fn parse_input(args: &Args) -> Result<(String, String, Option<String>)> {
     // 优先使用位置参数 URL
     let input_url = args.url.as_ref().or(args.repo.as_ref());
 
@@ -131,9 +152,7 @@ fn parse_input(args: &Args) -> Result<(String, String, String)> {
             let branch = args.branch.clone()
                 .or(parsed.branch)
                 .unwrap_or_else(|| "main".to_string());
-            let path = args.path.clone()
-                .or(parsed.path)
-                .ok_or_else(|| anyhow!("无法从 URL 中提取路径信息，请使用 --path 参数指定"))?;
+            let path = args.path.clone().or(parsed.path);
             
             return Ok((repo, branch, path));
         }
@@ -141,8 +160,7 @@ fn parse_input(args: &Args) -> Result<(String, String, String)> {
         // 否则作为 repo 参数处理
         let repo = url.clone();
         let branch = args.branch.clone().unwrap_or_else(|| "main".to_string());
-        let path = args.path.clone()
-            .ok_or_else(|| anyhow!("缺少 --path 参数，请指定仓库内的子目录路径"))?;
+        let path = args.path.clone();
         
         return Ok((repo, branch, path));
     }
@@ -255,12 +273,14 @@ fn build_repo_url(repo: &str) -> Result<String> {
     ))
 }
 
-/// 使用 sparse-checkout 在临时目录中克隆仓库的指定子目录
-fn clone_with_sparse_checkout(
+/// 在临时目录中克隆仓库
+/// - subdir 为 Some 时：使用 sparse-checkout 仅拉取指定子目录
+/// - subdir 为 None 时：拉取整个仓库
+fn clone_repository(
     temp_dir: &Path,
     repo_url: &str,
     branch: &str,
-    subdir: &str,
+    subdir: Option<&str>,
     _token: Option<&str>,
 ) -> Result<()> {
     println!("📥 正在初始化仓库...");
@@ -271,16 +291,20 @@ fn clone_with_sparse_checkout(
     // 2. git remote add origin <url>
     run_git_command(temp_dir, &["remote", "add", "origin", repo_url])?;
 
-    // 3. 启用 sparse-checkout
-    run_git_command(temp_dir, &["config", "core.sparseCheckout", "true"])?;
+    if let Some(subdir) = subdir {
+        // 3. 启用 sparse-checkout
+        run_git_command(temp_dir, &["config", "core.sparseCheckout", "true"])?;
 
-    // 4. 配置 sparse-checkout 路径
-    let sparse_checkout_path = temp_dir.join(".git/info/sparse-checkout");
-    std::fs::create_dir_all(sparse_checkout_path.parent().unwrap())?;
-    std::fs::write(&sparse_checkout_path, format!("{}\n", subdir))
-        .context("无法写入 sparse-checkout 配置")?;
+        // 4. 配置 sparse-checkout 路径
+        let sparse_checkout_path = temp_dir.join(".git/info/sparse-checkout");
+        std::fs::create_dir_all(sparse_checkout_path.parent().unwrap())?;
+        std::fs::write(&sparse_checkout_path, format!("{}\n", subdir))
+            .context("无法写入 sparse-checkout 配置")?;
 
-    println!("📥 正在拉取仓库（仅获取指定子目录）...");
+        println!("📥 正在拉取仓库（仅获取指定子目录）...");
+    } else {
+        println!("📥 正在拉取仓库（完整仓库）...");
+    }
 
     // 5. git fetch --depth=1 origin <branch>
     let fetch_result = run_git_command(temp_dir, &["fetch", "--depth=1", "origin", branch]);
